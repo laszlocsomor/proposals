@@ -28,22 +28,23 @@ explains how.
 ## Test execution
 
 Bazel runs tests by executing `TestRunnerAction`s. Test actions are similar to
-build actions (e.g. `SpawnAction`): they take a list of input files, execute a
-command, and produce some output files.
+build actions: they take a set of input files, execute a command, and are
+expected to produce a set of output files.
 
 The inputs of the test action are the test binary and its dependencies, plus
-some extra helper files such as the test wrapper script
+some tools such as the test wrapper script
 (`@bazel_tools//tools/test/test-setup.sh`) and optionally the coverage collector
 and LCOV merger tools.
 
 The command of the test action is the test wrapper script, plus additional
 user-specified arguments. This script initializes the environment for the actual
 test binary, then runs the test.
+See [Test wrapper control flow](#test-wrapper-control-flow).
 
 The outputs of the test action are the XML test log and the "undeclared outputs"
 file. The XML test log is an XML file that records two things: metadata about
 the test (such as the test target name, whether the test passed or failed), and
-the textual text log (that is, the output to `stdout` and `stderr`). The
+the textual test log (that is, the output to `stdout` and `stderr`). The
 undeclared outputs file is a zip archive of files that the test created and are
 potentially interesting to the user.
 
@@ -73,12 +74,12 @@ Bazel on Windows terminates tests abruptly in the following locations:
 
 ## Test wrapper control flow
 
-1.  Absolutizes path-storing environment variables.
+1.  Absolutizes and exports path-storing environment variables.
 
     **Why**: At the time of creating the `TestRunnerAction` (along with its
     environment), Bazel doesn't yet know the execution root the test will run
     under. `test-setup.sh` absolutizes the envvars by making them relative to
-    `$PWD`.
+    `$PWD` and exports them for child processes.
 
 1.  Creates some directories, e.g. for the undeclared outputs, the shard status
     file, the XML test log, and the test temp directory.
@@ -131,7 +132,7 @@ Bazel on Windows terminates tests abruptly in the following locations:
 1.  Sets `$TEST_PATH` to the absolute path of the test executable.
 
     If `$TEST_SHORT_EXEC_PATH` is defined, it sets an alternative `$TEST_PATH`.
-    
+
     **Why**: To avoid too long paths on Windows with remote execution.
 
 1.  Traps all signals to be handled by `write_xml_output_file()`.
@@ -173,7 +174,7 @@ Bazel on Windows terminates tests abruptly in the following locations:
 
     **Why**: Tests may produce valuable output files in the
     `$TEST_UNDECLARED_OUTPUTS_DIR` directory. These outputs are undeclared, they
-    are not part of the test acton's signature, so Bazel is unaware of them.
+    are not part of the test action's signature, so Bazel is unaware of them.
     Bazel archives the entire directory to retrieve these files from the from
     the sandbox or remote machine.
 
@@ -228,26 +229,36 @@ test process.
 
 ## Processes
 
-There will be two or three processes per test (same numbers as today):
+There will be two or three processes per test:
 
 *   a parent process, which runs the test wrapper
 
 *   a child process, which runs either the test binary or the coverage collector
 
-*   optionally a second child process after the first one finished, which runs
-    the `$LCOV_MERGER` when coverage collection is requested
+*   in case coverage collection is requested and the coverage collector
+    successfully exited: a second child process that runs the `$LCOV_MERGER`
+
+To ensure that terminating the test wrapper (in case it times out; see
+[Abrupt test termination](#abrupt-test-termination)) also terminates the child
+processes, we assign the parent and child processes to the same
+[Job Object](https://docs.microsoft.com/en-us/windows/desktop/ProcThread/job-objects).
+
+To avoid terminating all test wrappers and tests, we create a new Job Object for
+each `TestRunnerAction`.
 
 ## Abrupt test termination
 
-We change Bazel not to forcefully terminate the test wrapper process upon
-interruption, but instead:
+In order to let the test wrapper finish writing the XML file even if the user or
+Bazel interrupts it, we change Bazel not to forcefully terminate the process
+upon interruption, but instead:
 
-1.  ask the process to interrupt and shut down, by sending it a control message
-    on some channel
+1.  notify the process about the interruption by sending it a control message on
+    some channel
 
 1.  wait some time for the process to complete its shutdown protocol
 
-1.  forcefully terminate the process only if it's still running after a timeout.
+1.  forcefully terminate the process only when it's still running after a
+    timeout, to avoid hanging because of a stuck test wrapper process.
 
 ### Interruption request
 
@@ -256,7 +267,7 @@ test wrapper's `stdin`.
 
 Using `stdin` is simple and convenient: the only supported control message is
 the request for interruption. For now a single byte will suffice as this
-message. This communication protocol is easily exendable if necessary.
+message. This communication protocol is easily extensible if necessary.
 
 Using `stdin` is also safe: no other process has a handle to the test wrapper's
 `stdin`, so no other process will inadvertently send the interruption request.
@@ -266,10 +277,10 @@ Using `stdin` is also safe: no other process has a handle to the test wrapper's
 When requested to interrupt and shut down, the test wrapper should exit as soon
 as possible.
 
-The primary output of test execution is the XML test log: it carries the most
-useful information for the user. The XML file records the test's status (passed
-or failed) and the test's textual output. The test wrapper should ensure it
-always writes the XML test log.
+The primary output of test execution is the XML test log: it carries crucial
+information for the user. The XML file records the test's status (passed or
+failed) and the test's textual output. The test wrapper should ensure it always
+writes the XML test log.
 
 Textual test outputs are typically around a few MBs, though at their extreme
 reach sizes of several GBs. To avoid having to write the whole XML file as part
@@ -283,8 +294,8 @@ the test wrapper:
 1.  creates a temporary file under `$TEST_TMPDIR`, opens it for writing and read
     sharing
 
-1.  creates the child process such that `stdout` and `stderr` are redirected to
-    the temporary file.
+1.  creates the child processes such that `stdout` and `stderr` are redirected
+    to the temporary file.
 
 After the test wrapper finished writing the XML test log, it starts archiving
 the undeclared outputs. This operation may not finish within the forceful
@@ -304,8 +315,7 @@ A timeout of 1 second seems to suffice.
 ## `rlocation()` support for `sh_test` rules
 
 The new test execution mechanism will not define `rlocation()` for the benefit
-of `sh_test` rules. See the [Backward compatibility](#backward-compatibility)
-section for details.
+of `sh_test` rules. See [Backward compatibility](#backward-compatibility).
 
 # Implementation language
 
@@ -340,7 +350,7 @@ Addressing every step in the [current design](#current-design):
 
 *   steps 1, 2, 3: We'll use Windows API functions or custom logic for these. We
     pass environment variables to `CreateProcessW` to export them for the child
-    process(es). 
+    processes.
 
 *   step 4: The new test wrapper will not do this, see
     [Backward compatibility](#backward-compatibility). To look up the test
@@ -351,8 +361,9 @@ Addressing every step in the [current design](#current-design):
 
 *   step 6: We'll implement the encoding as custom logic.
 
-*   step 7: We'll use `SetCurrentDirectoryW`, or if the path is too long, create
-    a junction under `$TEST_TMPDIR` pointing at it.
+*   step 7: We'll use `SetCurrentDirectoryW`. If the path is too long, we create
+    a junction under `$TEST_TMPDIR` pointing at the path, and change the current
+    directory to the junction.
 
 *   step 8: This step is unnecessary. The new test wrapper will look up the test
     binary's path using the C++ runfiles library; see step 4.
@@ -361,7 +372,7 @@ Addressing every step in the [current design](#current-design):
 
 *   step 10: This step is unnecessary by design, see
     [Interruption request](#interruption-request).
-    
+
 *   step 11: The test wrapper opens the file that the test's textual output is
     redirected to with read sharing, enabling to stream the output to its own
     `stdout`.
@@ -406,10 +417,10 @@ and revert to the old mechanism in case they discover bugs.
 We will roll out this feature over several Bazel minor versions:
 
 1.  version `0.N.*`: contains both the new and old test execution mechanisms and
-    supports the `--[no]windows_bashless_test` flag. By default the flag is
-    disabled and Bazel uses the old (Bash-based) test execution. We ask users to
-    enable the flag and report bugs. We move on to the next stage when all known
-    bugs are fixed.
+    supports the `--[no]windows_native_test_wrapper` flag. By default the flag
+    is disabled and Bazel uses the old (non-native, Bash-based) test execution.
+    We ask users to enable the flag and report bugs. We move on to the next
+    stage when all known bugs are fixed.
 
 1.  version `0.N+k.*` (`k` &gt; 0): the flag is enabled by default. We ask users
     to file bugs whenever they find a use-case to disable the flag. We move on
