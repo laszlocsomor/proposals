@@ -205,12 +205,17 @@ The new solution must be guarded by a flag. This allows us to roll out the
 feature in multiple stages, and users to easily revert to the old behavior in
 case the new one is buggy.
 
+## Works with remote execution
+
+The new solution must work with remote execution. Bazel currently executes
+`test-setup.sh` on the remote machine. The new test wrapper should be a drop-in
+replacement for `test-setup.sh` in this scenario too.
+
 # Non-requirements of the solution
 
-The solution does not have to cover remote test execution, because Bazel does
-not manage remote processes. To run a test remotely, Bazel sends a request to a
-service and waits for the reply which contains the XML test log and all other
-test outputs.
+It is beyond the scope of this design to discuss whether Bazel fetches the XML
+log from the remote machine after a test timeout or test interruption. This
+question falls into the general domain of remote action execution.
 
 # Design
 
@@ -236,17 +241,41 @@ There will be two or three processes per test:
 *   a child process, which runs either the test binary or the coverage collector
 
 *   in case coverage collection is requested and the coverage collector
-    successfully exited: a second child process that runs the `$LCOV_MERGER`
+    succeeded: a second child process that runs the `$LCOV_MERGER`
 
-To ensure that terminating the test wrapper (in case it times out; see
-[Abrupt test termination](#abrupt-test-termination)) also terminates the child
-processes, we assign the parent and child processes to the same
-[Job Object](https://docs.microsoft.com/en-us/windows/desktop/ProcThread/job-objects).
+To ensure that terminating the test wrapper, in case it fails to shut down
+fast enough (see [Abrupt test termination](#abrupt-test-termination)), also
+terminates the child processes, we assign the parent and child processes to the
+same [Job Object](https://docs.microsoft.com/en-us/windows/desktop/ProcThread/job-objects).
 
 To avoid terminating all test wrappers and tests, we create a new Job Object for
 each `TestRunnerAction`.
 
-## Abrupt test termination
+## Timeout
+
+For sake of a more self-contained test wrapper that can run both locally and on
+remote machines, the test wrapper will monitor the elapsed time since its start
+and initiate the [shutdown protocol](#shutdown-protocol) if the time exceeds
+the test's timeout.
+
+This ensures that the test wrapper exits both when it runs locally and when it
+runs remotely.
+
+However Bazel will also monitor the elapsed time, so that:
+
+*   with local execution, it can kill the test wrapper in case the test wrapper
+    hung beyond the timeout and failed to shut down
+
+*   with remote execution, Bazel can terminate the connection and report with
+    certainty that the test timed out.
+
+Whether Bazel attempts retrieve the XML test log from the remote machine in case
+the test wrapper successfully wrote it, or how to attempt this, is beyond the
+scope of this design.
+
+## Interruption
+
+### Local test execution
 
 In order to let the test wrapper finish writing the XML file even if the user or
 Bazel interrupts it, we change Bazel not to forcefully terminate the process
@@ -260,10 +289,8 @@ upon interruption, but instead:
 1.  forcefully terminate the process only when it's still running after a
     timeout, to avoid hanging because of a stuck test wrapper process.
 
-### Interruption request
-
-The communication channel between Bazel and the test wrapper process will be the
-test wrapper's `stdin`.
+For local test execution, the communication channel between Bazel and the test
+wrapper process will be the test wrapper's `stdin`.
 
 Using `stdin` is simple and convenient: the only supported control message is
 the request for interruption. For now a single byte will suffice as this
@@ -271,6 +298,13 @@ message. This communication protocol is easily extensible if necessary.
 
 Using `stdin` is also safe: no other process has a handle to the test wrapper's
 `stdin`, so no other process will inadvertently send the interruption request.
+
+### Remote test execution
+
+When Bazel or the user interrupt remotely running tests, Bazel will signal the
+fact of the interruption (provided the remote execution service supports such
+signalling), then Bazel will close the connection, and report that the test's
+status is unknown.
 
 ### Shutdown protocol
 
@@ -303,12 +337,13 @@ termination timeout, but that's fine: the most important output is the XML file.
 If the test was interrupted, retrieving the undeclared outputs is done on a
 best-effort basis.
 
-### Termination timeout
+### Shutdown timeout
 
-The timeout should be long enough for the test wrapper to finish writing the XML
-file, terminate the active child process, and exit. We established that the test
-wrapper will continuously covert the test log, so we expect that finishing up
-the XML file is faster than writing the entire multi-GB test log.
+The shutdown timeout should be long enough for the test wrapper to finish
+writing the XML file, terminate the active child process, and exit. We
+established that the test wrapper will continuously covert the test log, so we
+expect that finishing up the XML file is faster than writing the entire multi-GB
+test log.
 
 A timeout of 1 second seems to suffice.
 
@@ -345,6 +380,8 @@ all versions of Windows 7 and of Windows Server 2008 R2 (the equivalent server
 version) include the .NET framework 3.5.
 
 # Design adequacy
+
+## Features
 
 Addressing every step in the [current design](#current-design):
 
@@ -386,10 +423,21 @@ Addressing every step in the [current design](#current-design):
 
 *   step 13: We'll use Windows API functions to list the directory
     (`FindFirstFileW`) and to write the files. It's enough to open these files
-    with read sharing and without deletion sharing, because if the test wrapper
-    is forcefully terminated then the OS closes its file handles.
+    with read sharing and without deletion sharing, because in case the test
+    wrapper is forcefully terminated, the OS closes its file handles.
 
 *   step 14: We'll use the zip compressor in `//third_party/ijar`.
+
+## Compatibility with remote execution
+
+The test wrapper works remotely as well as locally. The difference to local
+execution is, Bazel and the test wrapper run on different machines, therefore
+nothing connects to the test wrapper's `stdin` and nothing asks it to shut down
+in case the user or Bazel interrupts tests.
+
+If the remotely running test wrapper notices that the test timed out, it will
+[shut down](#shutdown-protocol) the same way it would do locally, in case Bazel
+attempts to fetch the test XML from the remote machine.
 
 # Backward-compatibility
 
