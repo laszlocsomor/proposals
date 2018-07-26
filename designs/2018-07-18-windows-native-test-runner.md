@@ -213,9 +213,10 @@ replacement for `test-setup.sh` in this scenario too.
 
 # Non-requirements of the solution
 
-It is beyond the scope of this design to discuss whether Bazel fetches the XML
-log from the remote machine after a test timeout or test interruption. This
-question falls into the general domain of remote action execution.
+It is beyond the scope of this design to discuss whether Bazel attempts to fetch
+any outputs of the test action from the remote machine, in case the test timed
+out or got interrupted. This question falls into the domain of general remote
+action execution.
 
 # Design
 
@@ -306,7 +307,7 @@ fact of the interruption (provided the remote execution service supports such
 signalling), then Bazel will close the connection, and report that the test's
 status is unknown.
 
-### Shutdown protocol
+## Shutdown protocol
 
 When requested to interrupt and shut down, the test wrapper should exit as soon
 as possible.
