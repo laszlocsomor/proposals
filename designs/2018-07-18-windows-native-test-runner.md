@@ -81,15 +81,15 @@ Bazel on Windows terminates tests abruptly in the following locations:
     under. `test-setup.sh` absolutizes the envvars by making them relative to
     `$PWD` and exports them for child processes.
 
-1.  Creates some directories, e.g. for the undeclared outputs, the shard status
+2.  Creates some directories, e.g. for the undeclared outputs, the shard status
     file, the XML test log, and the test temp directory.
 
-1.  Exports some environment variables.
+3.  Exports some environment variables.
 
     **Why**: Tests and test runners require envvars such as `$TEST_TMPDIR` and
     `$TEST_SHARD_INDEX`.
 
-1.  Defines `rlocation()` to look up paths of data-dependencies.
+4.  Defines `rlocation()` to look up paths of data-dependencies.
 
     **Why**:
 
@@ -99,13 +99,21 @@ Bazel on Windows terminates tests abruptly in the following locations:
         use-case does not apply for the subset of shell tests that use the Bash
         runfiles library in `@bazel_tools//tools/bash/runfiles`.
 
-1.  Defines `encode_output_file()`.
+5.  Defines `encode_output_file()`.
 
-    This function runs `perl` and `sed` to sanitize the textual test log for the
-    test XML test log's CDATA section. `write_xml_output_file()` calls this
-    function.
+    When `$EXPERIMENTAL_SPLIT_XML_GENERATION` is set to "1", this function is
+    not used.
 
-1.  Defines `write_xml_output_file()` that:
+    Otherwise, this function runs `perl` and `sed` to sanitize the textual test
+    log for the test XML test log's CDATA section. `write_xml_output_file()`
+    calls this function.
+
+6.  Defines `write_xml_output_file()`.
+
+    When `$EXPERIMENTAL_SPLIT_XML_GENERATION` is set to "1", this function is
+    not used.
+
+    Otherwise, this function:
 
     *   Creates the test XML file, with the help of `encode_output_file()`.
 
@@ -114,14 +122,14 @@ Bazel on Windows terminates tests abruptly in the following locations:
         **Why**: `${XML_OUTPUT_FILE}.log` is a temporary file containing the
         test's raw output.
 
-1.  Changes the current directory to the test's runfiles directory (only when
+7.  Changes the current directory to the test's runfiles directory (only when
     coverage collection is disabled).
 
     **Why**: Actions run in the execroot by default. Changing the directory
     prevents a locally executed, non-sandboxed test from accessing undeclared
     inputs files.
 
-1.  Adds `.` to `$PATH`.
+8.  Adds `.` to `$PATH`.
 
     **Why**: To run the test executable without having to add `./` if the binary
     is in the current directory.
@@ -129,20 +137,20 @@ Bazel on Windows terminates tests abruptly in the following locations:
     In fact this step is unnecessary, because the test executable's path is
     always absolute.
 
-1.  Sets `$TEST_PATH` to the absolute path of the test executable.
+9.  Sets `$TEST_PATH` to the absolute path of the test executable.
 
     If `$TEST_SHORT_EXEC_PATH` is defined, it sets an alternative `$TEST_PATH`.
 
     **Why**: To avoid too long paths on Windows with remote execution.
 
-1.  Traps all signals to be handled by `write_xml_output_file()`.
+10. Traps all signals to be handled by `write_xml_output_file()`.
 
     **Why**: If the test is abruptly terminated (e.g. the user interrupts test
     execution or the test times out), Bash executes the signal handler and
     `write_xml_output_file()` writes an output file, which records the fact that
     the test terminated abruptly.
 
-1.  Runs the test:
+11. Runs the test:
 
     If it can, runs the test as a subprocess and redirects the test's output to
     `${XML_OUTPUT_FILE}.log` while also streaming the output to stdout via
@@ -165,12 +173,15 @@ Bazel on Windows terminates tests abruptly in the following locations:
     This mode triggers Google-specific code paths that rely on `/usr/bin/lcov`.
     This use-case is unsupported on Windows.
 
-1.  Resets all signal handlers, calls `write_xml_output_file()`.
+12. Resets all signal handlers.
 
     **Why**: The test terminated normally so it's safe to reset the default
     signal handlers.
 
-1.  Writes the manifest- and annotation files for the undeclared outputs.
+13. If `$EXPERIMENTAL_SPLIT_XML_GENERATION` is *not* set to "1", calls
+    `write_xml_output_file()`.
+
+14. Writes the manifest- and annotation files for the undeclared outputs.
 
     **Why**: Tests may produce valuable output files in the
     `$TEST_UNDECLARED_OUTPUTS_DIR` directory. These outputs are undeclared, they
@@ -178,7 +189,19 @@ Bazel on Windows terminates tests abruptly in the following locations:
     Bazel archives the entire directory to retrieve these files from the from
     the sandbox or remote machine.
 
-1.  Creates a zip file of the undeclared outputs.
+15. Creates a zip file of the undeclared outputs.
+
+## Split XML generation
+
+When
+[`--experimental_split_xml_generation`](https://github.com/bazelbuild/bazel/commit/0858ae1f6eb890c1e203a2aa21130ba34ca36a27#diff-cc3389803502ea4e583729a6a9d28ea0R313)
+is enabled, Bazel sets `$EXPERIMENTAL_SPLIT_XML_GENERATION` to "1", and runs
+`tools/test/generate-xml.sh` in a separate action after the `TestRunnerAction`.
+This script implements the same logic as `encode_output_file` and
+`write_xml_output_file` do in steps 5 and 6 above.
+
+When `--experimental_split_xml_generation` is disabled, the test wrapper writes
+the XML.
 
 # Requirements of the solution
 
@@ -314,8 +337,11 @@ as possible.
 
 The primary output of test execution is the XML test log: it carries crucial
 information for the user. The XML file records the test's status (passed or
-failed) and the test's textual output. The test wrapper should ensure it always
-writes the XML test log.
+failed) and the test's textual output.
+
+When `$EXPERIMENTAL_SPLIT_XML_GENERATION` is set to "1", the test wrapper should
+ensure it always writes the XML test log. (Otherwise another tool writes this
+file.)
 
 Textual test outputs are typically around a few MBs, though at their extreme
 reach sizes of several GBs. To avoid having to write the whole XML file as part
@@ -356,7 +382,7 @@ of `sh_test` rules. See [Backward compatibility](#backward-compatibility).
 # Implementation language
 
 We'll implement the test wrapper in C++, compile it as a x86\_64 Windows binary,
-and bundle it with Bazel as `@bazel_tools//tools/test:test-wrapper.exe`.
+and bundle it with Bazel as `@bazel_tools//tools/test/windows:test-wrapper.exe`.
 
 Rationale:
 
@@ -384,7 +410,7 @@ version) include the .NET framework 3.5.
 
 ## Features
 
-Addressing every step in the [current design](#current-design):
+Addressing every step in the [current test wrapper design](#current-design):
 
 *   steps 1, 2, 3: We'll use Windows API functions or custom logic for these. We
     pass environment variables to `CreateProcessW` to export them for the child
@@ -422,12 +448,23 @@ Addressing every step in the [current design](#current-design):
 *   step 12: This step is unnecessary on Windows, see
     [Constraints](#constraints).
 
-*   step 13: We'll use Windows API functions to list the directory
+*   step 13: No special handling necessary. The
+    [shutdown protocol](#shutdown-protocol) will respect the value of
+    `$EXPERIMENTAL_SPLIT_XML_GENERATION`.
+
+*   step 14: We'll use Windows API functions to list the directory
     (`FindFirstFileW`) and to write the files. It's enough to open these files
     with read sharing and without deletion sharing, because in case the test
     wrapper is forcefully terminated, the OS closes its file handles.
 
-*   step 14: We'll use the zip compressor in `//third_party/ijar`.
+*   step 15: We'll use the zip compressor in `//third_party/ijar`.
+
+Addressing [split XML generation](#split-xml-generation):
+
+*   The test wrapper already implements the complete logic for
+    `@bazel_tools//tools/test:generate-xml.sh`. We'll create a separate program
+    (`@bazel_tools//tools/test/windows:generate-xml.exe`) that wraps the
+    test-wrapper's XML-writing logic.
 
 ## Compatibility with remote execution
 
