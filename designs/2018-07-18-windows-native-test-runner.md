@@ -1,6 +1,6 @@
 ---
 created: 2018-07-18
-last updated: 2018-07-24
+last updated: 2018-08-03
 status: To be reviewed
 reviewers: ulfjack (lead), lberki, dslomov
 title: Test execution on Windows without Bash
